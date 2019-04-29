@@ -75,6 +75,8 @@ local function check_domain(email, whitelist_failed)
       end
       return ngx.exit(ngx.HTTP_FORBIDDEN)
     end
+  elseif whitelist_failed then
+    return ngx.exit(ngx.HTTP_FORBIDDEN)
   end
 end
 
@@ -111,7 +113,6 @@ end
 
 local function request_access_token(code)
   local request = http.new()
-
 
   request:set_timeout(7000)
 
@@ -247,8 +248,7 @@ local function authorize()
     "OauthProfile="     .. ngx.escape_uri(json.encode(profile)) .. cookie_tail,
   }
 
-  --return ngx.redirect(uri_args["state"])
-  return ngx.redirect("/")
+  return ngx.redirect(uri_args["state"])
 end
 
 local function handle_signout()
@@ -266,6 +266,9 @@ end
 
 -- if already authenticated, but still receives a /_oauth request, redirect to the correct destination
 if uri == "/_oauth" then
-  --return ngx.redirect(uri_args["state"])
-  return ngx.redirect("/")
+  if uri_args["state"] then
+    return ngx.redirect(uri_args["state"])
+  else
+    return ngx.redirect("/")
+  end
 end
