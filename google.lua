@@ -35,17 +35,13 @@ if blacklist:len() == 0 then
   blacklist = nil
 end
 
-local function handle_token_uris(email, token, expires, profile)
+local function handle_token_uris(email, token, expires)
   if uri == "/_token.json" then
     ngx.header["Content-type"] = "application/json"
     ngx.say(json.encode({
       email   = email,
       token   = token,
       expires = expires,
-      first_name = profile['First_Name'],
-      last_name = profile['Last_Name'],
-      display_name = profile['Display_Name'],
-      ZUID = profile['ZUID']
     }))
     ngx.exit(ngx.OK)
   end
@@ -75,10 +71,12 @@ local function check_domain(email, whitelist_failed)
       end
       return ngx.exit(ngx.HTTP_FORBIDDEN)
     end
+  elseif whitelist_failed then
+    return ngx.exit(ngx.HTTP_FORBIDDEN)
   end
 end
 
-local function on_auth(email, token, expires, profile)
+local function on_auth(email, token, expires)
   if blacklist then
     -- blacklisted user is always rejected
     if string.find(" " .. blacklist .. " ", " " .. email .. " ", 1, true) then
@@ -105,27 +103,24 @@ local function on_auth(email, token, expires, profile)
       ngx.var.user = email:match("([^@]+)@.+")
     end
   end
-  
-  handle_token_uris(email, token, expires, profile)
+
+  handle_token_uris(email, token, expires)
 end
 
 local function request_access_token(code)
   local request = http.new()
 
-
   request:set_timeout(7000)
 
-  local uri = "https://accounts.zoho.com/oauth/v2/token?" .. ngx.encode_args({
+  local res, err = request:request_uri("https://accounts.google.com/o/oauth2/token", {
+    method = "POST",
+    body = ngx.encode_args({
       code          = code,
-      grant_type="authorization_code",
       client_id     = client_id,
       client_secret = client_secret,
       redirect_uri  = cb_url,
-      scope         = "Aaaserver.profile.read",
-  })
-
-  local res, err = request:request_uri(uri , {
-    method = "POST",
+      grant_type    = "authorization_code",
+    }),
     headers = {
       ["Content-type"] = "application/x-www-form-urlencoded"
     },
@@ -136,7 +131,7 @@ local function request_access_token(code)
   end
 
   if res.status ~= 200 then
-    return nil, "received " .. res.status .. " from https://accounts.zoho.com/oauth/v2/auth: " .. res.body
+    return nil, "received " .. res.status .. " from https://accounts.google.com/o/oauth2/token: " .. res.body
   end
 
   return json.decode(res.body)
@@ -147,9 +142,9 @@ local function request_profile(token)
 
   request:set_timeout(7000)
 
-  local res, err = request:request_uri("https://accounts.zoho.com/oauth/user/info", {
+  local res, err = request:request_uri("https://www.googleapis.com/oauth2/v2/userinfo", {
     headers = {
-      ["Authorization"] = "Zoho-oauthtoken " .. token,
+      ["Authorization"] = "Bearer " .. token,
     },
     ssl_verify = true,
   })
@@ -170,7 +165,6 @@ local function is_authorized()
   local expires = tonumber(ngx.var.cookie_OauthExpires) or 0
   local email   = ngx.unescape_uri(ngx.var.cookie_OauthEmail or "")
   local token   = ngx.unescape_uri(ngx.var.cookie_OauthAccessToken or "")
-  local profile = json.decode(ngx.unescape_uri(ngx.var.cookie_OauthProfile or "{}"))
 
   if expires == 0 and headers["oauthexpires"] then
     expires = tonumber(headers["oauthexpires"])
@@ -187,7 +181,7 @@ local function is_authorized()
   local expected_token = ngx.encode_base64(ngx.hmac_sha1(token_secret, cb_server_name .. email .. expires))
 
   if token == expected_token and expires and expires > ngx.time() - extra_validity then
-    on_auth(email, token, expires, profile)
+    on_auth(email, expected_token, expires)
     return true
   else
     return false
@@ -195,12 +189,14 @@ local function is_authorized()
 end
 
 local function redirect_to_auth()
-  return ngx.redirect("https://accounts.zoho.com/oauth/v2/auth?" .. ngx.encode_args({
-      scope         = "Aaaserver.profile.read",
-      client_id     = client_id,
-      redirect_uri  = cb_url,
-      access_type   = "offline",
-      response_type = "code"
+  -- google seems to accept space separated domain list in the login_hint, so use this undocumented feature.
+  return ngx.redirect("https://accounts.google.com/o/oauth2/auth?" .. ngx.encode_args({
+    client_id     = client_id,
+    scope         = "email",
+    response_type = "code",
+    redirect_uri  = cb_url,
+    state         = redirect_url,
+    login_hint    = domain,
   }))
 end
 
@@ -210,7 +206,7 @@ local function authorize()
   end
 
   if uri_args["error"] then
-    ngx.log(ngx.ERR, "received " .. uri_args["error"] )
+    ngx.log(ngx.ERR, "received " .. uri_args["error"] .. " from https://accounts.google.com/o/oauth2/auth")
     return ngx.exit(ngx.HTTP_FORBIDDEN)
   end
 
@@ -235,20 +231,18 @@ local function authorize()
     cookie_tail = cookie_tail .. ";httponly"
   end
 
-  local email      = profile["Email"]
+  local email      = profile["email"]
   local user_token = ngx.encode_base64(ngx.hmac_sha1(token_secret, cb_server_name .. email .. expires))
 
-  on_auth(email, user_token, expires, profile)
+  on_auth(email, user_token, expires)
 
   ngx.header["Set-Cookie"] = {
     "OauthEmail="       .. ngx.escape_uri(email) .. cookie_tail,
     "OauthAccessToken=" .. ngx.escape_uri(user_token) .. cookie_tail,
     "OauthExpires="     .. expires .. cookie_tail,
-    "OauthProfile="     .. ngx.escape_uri(json.encode(profile)) .. cookie_tail,
   }
 
-  --return ngx.redirect(uri_args["state"])
-  return ngx.redirect("/")
+  return ngx.redirect(uri_args["state"])
 end
 
 local function handle_signout()
@@ -266,6 +260,9 @@ end
 
 -- if already authenticated, but still receives a /_oauth request, redirect to the correct destination
 if uri == "/_oauth" then
-  --return ngx.redirect(uri_args["state"])
-  return ngx.redirect("/")
+  if uri_args["state"] then
+    return ngx.redirect(uri_args["state"])
+  else
+    return ngx.redirect("/")
+  end
 end
