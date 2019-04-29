@@ -35,13 +35,17 @@ if blacklist:len() == 0 then
   blacklist = nil
 end
 
-local function handle_token_uris(email, token, expires)
+local function handle_token_uris(email, token, expires, profile)
   if uri == "/_token.json" then
     ngx.header["Content-type"] = "application/json"
     ngx.say(json.encode({
       email   = email,
       token   = token,
       expires = expires,
+      first_name = profile['First_Name'],
+      last_name = profile['Last_Name'],
+      display_name = profile['Display_Name'],
+      ID = profile['ID']
     }))
     ngx.exit(ngx.OK)
   end
@@ -76,7 +80,7 @@ local function check_domain(email, whitelist_failed)
   end
 end
 
-local function on_auth(email, token, expires)
+local function on_auth(email, token, expires, profile)
   if blacklist then
     -- blacklisted user is always rejected
     if string.find(" " .. blacklist .. " ", " " .. email .. " ", 1, true) then
@@ -103,8 +107,8 @@ local function on_auth(email, token, expires)
       ngx.var.user = email:match("([^@]+)@.+")
     end
   end
-
-  handle_token_uris(email, token, expires)
+  
+  handle_token_uris(email, token, expires, profile)
 end
 
 local function request_access_token(code)
@@ -112,15 +116,18 @@ local function request_access_token(code)
 
   request:set_timeout(7000)
 
-  local res, err = request:request_uri("https://accounts.google.com/o/oauth2/token", {
-    method = "POST",
-    body = ngx.encode_args({
+  local uri = "https://login.microsoftonline.com/common/oauth2/v2.0/token" 
+  local body = ngx.encode_args({
       code          = code,
       client_id     = client_id,
       client_secret = client_secret,
       redirect_uri  = cb_url,
       grant_type    = "authorization_code",
-    }),
+  })
+
+  local res, err = request:request_uri(uri , {
+    method = "POST",
+    body = body,
     headers = {
       ["Content-type"] = "application/x-www-form-urlencoded"
     },
@@ -131,7 +138,7 @@ local function request_access_token(code)
   end
 
   if res.status ~= 200 then
-    return nil, "received " .. res.status .. " from https://accounts.google.com/o/oauth2/token: " .. res.body
+    return nil, "received " .. res.status .. " from https://login.microsoftonline.com/common/oauth2/v2.0/token: " .. res.body
   end
 
   return json.decode(res.body)
@@ -142,7 +149,7 @@ local function request_profile(token)
 
   request:set_timeout(7000)
 
-  local res, err = request:request_uri("https://www.googleapis.com/oauth2/v2/userinfo", {
+  local res, err = request:request_uri("https://graph.microsoft.com/v1.0/me", {
     headers = {
       ["Authorization"] = "Bearer " .. token,
     },
@@ -153,7 +160,7 @@ local function request_profile(token)
   end
 
   if res.status ~= 200 then
-    return nil, "received " .. res.status .. " from https://www.googleapis.com/oauth2/v2/userinfo"
+    return nil, "received " .. res.status .. " from https://graph.microsoft.com/v1.0/me"
   end
 
   return json.decode(res.body)
@@ -165,6 +172,7 @@ local function is_authorized()
   local expires = tonumber(ngx.var.cookie_OauthExpires) or 0
   local email   = ngx.unescape_uri(ngx.var.cookie_OauthEmail or "")
   local token   = ngx.unescape_uri(ngx.var.cookie_OauthAccessToken or "")
+  local profile = json.decode(ngx.unescape_uri(ngx.var.cookie_OauthProfile or "{}"))
 
   if expires == 0 and headers["oauthexpires"] then
     expires = tonumber(headers["oauthexpires"])
@@ -181,7 +189,7 @@ local function is_authorized()
   local expected_token = ngx.encode_base64(ngx.hmac_sha1(token_secret, cb_server_name .. email .. expires))
 
   if token == expected_token and expires and expires > ngx.time() - extra_validity then
-    on_auth(email, expected_token, expires)
+    on_auth(email, token, expires, profile)
     return true
   else
     return false
@@ -189,14 +197,12 @@ local function is_authorized()
 end
 
 local function redirect_to_auth()
-  -- google seems to accept space separated domain list in the login_hint, so use this undocumented feature.
-  return ngx.redirect("https://accounts.google.com/o/oauth2/auth?" .. ngx.encode_args({
+  return ngx.redirect("https://login.microsoftonline.com/common/oauth2/v2.0/authorize?" .. ngx.encode_args({
     client_id     = client_id,
-    scope         = "email",
-    response_type = "code",
-    redirect_uri  = cb_url,
-    state         = redirect_url,
-    login_hint    = domain,
+    scope         = "User.Read",
+      state         = redirect_url,
+      redirect_uri  = cb_url,
+      response_type = "code"
   }))
 end
 
@@ -206,10 +212,10 @@ local function authorize()
   end
 
   if uri_args["error"] then
-    ngx.log(ngx.ERR, "received " .. uri_args["error"] .. " from https://accounts.google.com/o/oauth2/auth")
+    ngx.log(ngx.ERR, "received " .. uri_args["error"] )
     return ngx.exit(ngx.HTTP_FORBIDDEN)
   end
-
+  
   local token, token_err = request_access_token(uri_args["code"])
   if not token then
     ngx.log(ngx.ERR, "got error during access token request: " .. token_err)
@@ -231,15 +237,21 @@ local function authorize()
     cookie_tail = cookie_tail .. ";httponly"
   end
 
-  local email      = profile["email"]
+  local email      = profile["userPrincipalName"]
   local user_token = ngx.encode_base64(ngx.hmac_sha1(token_secret, cb_server_name .. email .. expires))
 
-  on_auth(email, user_token, expires)
+  local p={}
+  p['First_Name']=profile['givenName']
+  p['Last_Name']=profile['surname']
+  p['Display_Name']=profile['displayName']
+  p['ID']=profile['id']
+  on_auth(email, user_token, expires, p)
 
   ngx.header["Set-Cookie"] = {
     "OauthEmail="       .. ngx.escape_uri(email) .. cookie_tail,
     "OauthAccessToken=" .. ngx.escape_uri(user_token) .. cookie_tail,
     "OauthExpires="     .. expires .. cookie_tail,
+    "OauthProfile="     .. ngx.escape_uri(json.encode(p)) .. cookie_tail,
   }
 
   return ngx.redirect(uri_args["state"])
